@@ -8,9 +8,13 @@ import json
 import yaml
 import click
 import requests
+import time
+import concurrent.futures
+import difflib
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from urllib.parse import urlparse
 from rich.console import Console
 from rich.table import Table
 from rich.json import JSON
@@ -49,17 +53,31 @@ class APITester:
             # Load default .env file
             if Path(self.env_file).exists():
                 load_dotenv(self.env_file)
+                self.current_env = 'default'
     
-    def substitute_vars(self, text: str) -> str:
-        """Substitute {{variable}} with environment variables"""
+    def substitute_vars(self, text: str, context: Optional[Dict] = None) -> str:
+        """Substitute {{variable}} with environment variables or context"""
         import re
-        pattern = r'\{\{(\w+)\}\}'
-        
+        pattern = r'\{\{([^}]+)\}\}'
+
         def replace(match):
-            var_name = match.group(1)
-            value = os.getenv(var_name, match.group(0))
-            return value
-        
+            var_path = match.group(1).strip()
+            # First try context
+            if context:
+                try:
+                    keys = var_path.split('.')
+                    value = context
+                    for key in keys:
+                        value = value[key]
+                    return str(value)
+                except (KeyError, TypeError):
+                    pass
+            # Then try env
+            if '.' not in var_path:
+                value = os.getenv(var_path, match.group(0))
+                return value
+            return match.group(0)
+
         return re.sub(pattern, replace, text)
     
     def send_request(
@@ -71,31 +89,47 @@ class APITester:
         body: Optional[Any] = None,
         auth: Optional[tuple] = None,
         timeout: int = 30,
-        verify: bool = True
+        verify: bool = True,
+        retry_count: int = 0,
+        retry_delay: float = 1.0,
+        context: Optional[Dict] = None
     ) -> requests.Response:
         """Send HTTP request"""
         # Substitute variables in URL and headers
-        url = self.substitute_vars(url)
-        
+        url = self.substitute_vars(url, context)
+
+        # Validate URL
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"Invalid URL: {url}")
+
         if headers:
-            headers = {k: self.substitute_vars(str(v)) for k, v in headers.items()}
-        
-        try:
-            response = requests.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                params=params,
-                json=body if isinstance(body, dict) else None,
-                data=body if not isinstance(body, dict) else None,
-                auth=auth,
-                timeout=timeout,
-                verify=verify
-            )
-            return response
-        except requests.exceptions.RequestException as e:
-            console.print(f"[red]Request failed: {e}[/red]")
-            raise
+            headers = {k: self.substitute_vars(str(v), context) for k, v in headers.items()}
+
+        last_exception = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = requests.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=body if isinstance(body, dict) else None,
+                    data=body if not isinstance(body, dict) else None,
+                    auth=auth,
+                    timeout=timeout,
+                    verify=verify
+                )
+                return response
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                if attempt < retry_count:
+                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                    console.print(f"[yellow]Request failed (attempt {attempt + 1}/{retry_count + 1}): {e}. Retrying in {delay:.1f}s...[/yellow]")
+                    time.sleep(delay)
+                else:
+                    console.print(f"[red]Request failed after {retry_count + 1} attempts: {e}[/red]")
+                    raise
     
     def format_response(self, response: requests.Response, show_headers: bool = False) -> str:
         """Format response for display"""
@@ -159,7 +193,7 @@ class APITester:
             json.dump({"name": name, "requests": requests}, f, indent=2)
         console.print(f"[green]Collection '{name}' saved successfully![/green]")
     
-    def load_collection(self, name: str) -> Dict:
+    def load_collection(self, name: str) -> Optional[Dict]:
         """Load a collection"""
         collection_file = self.collections_dir / f"{name}.json"
         if not collection_file.exists():
@@ -169,39 +203,108 @@ class APITester:
         with open(collection_file, 'r') as f:
             return json.load(f)
     
-    def run_test(self, response: requests.Response, assertions: List[str]) -> Dict:
+    def run_test(self, response: requests.Response, assertions: List[str], response_time: Optional[float] = None) -> Dict:
         """Run assertions on response"""
         results = {"passed": [], "failed": []}
-        
+
+        def parse_assertion(assertion: str):
+            """Parse assertion into field, operator, expected"""
+            operators = ['!=', '>=', '<=', '==', '>', '<']
+            for op in operators:
+                if op in assertion:
+                    parts = assertion.split(op, 1)
+                    return parts[0].strip(), op, parts[1].strip()
+            return None, None, None
+
         for assertion in assertions:
             try:
-                # Parse assertion (e.g., "status_code == 200", "body.key == 'value'")
-                if assertion.startswith("status_code"):
-                    expected = int(assertion.split("==")[1].strip())
-                    if response.status_code == expected:
-                        results["passed"].append(assertion)
-                    else:
-                        results["failed"].append(f"{assertion} (got {response.status_code})")
-                elif assertion.startswith("body."):
-                    # Simple JSON path assertion
-                    path = assertion.split("==")[0].strip().replace("body.", "")
-                    expected = assertion.split("==")[1].strip().strip("'\"")
+                field, op, expected_str = parse_assertion(assertion)
+                if not field or not op or not expected_str:
+                    results["failed"].append(f"{assertion} (invalid format)")
+                    continue
+
+                if field == "status_code":
+                    try:
+                        expected = int(expected_str)
+                        actual = response.status_code
+                        if self._compare(actual, op, expected):
+                            results["passed"].append(assertion)
+                        else:
+                            results["failed"].append(f"{assertion} (got {actual})")
+                    except ValueError:
+                        results["failed"].append(f"{assertion} (expected integer for status_code)")
+                elif field.startswith("body."):
+                    path = field.replace("body.", "")
+                    expected = expected_str.strip("'\"")
                     try:
                         body = response.json()
                         keys = path.split(".")
                         value = body
                         for key in keys:
                             value = value[key]
-                        if str(value) == expected:
+                        if self._compare(value, op, expected):
                             results["passed"].append(assertion)
                         else:
                             results["failed"].append(f"{assertion} (got {value})")
                     except:
                         results["failed"].append(f"{assertion} (invalid path or response not JSON)")
+                elif field == "response_time" and response_time is not None:
+                    try:
+                        expected_num = float(expected_str)
+                        actual = response_time * 1000  # Convert to ms
+                        if self._compare(actual, op, expected_num):
+                            results["passed"].append(assertion)
+                        else:
+                            results["failed"].append(f"{assertion} (got {actual:.2f}ms)")
+                    except ValueError:
+                        results["failed"].append(f"{assertion} (expected numeric value)")
+                elif field.startswith("header."):
+                    header_name = field.replace("header.", "")
+                    actual = response.headers.get(header_name, "")
+                    expected = expected_str.strip("'\"")
+                    if self._compare(actual, op, expected):
+                        results["passed"].append(assertion)
+                    else:
+                        results["failed"].append(f"{assertion} (got '{actual}')")
+                elif field == "response_size":
+                    try:
+                        expected_num = int(expected_str)
+                        actual = len(response.content)
+                        if self._compare(actual, op, expected_num):
+                            results["passed"].append(assertion)
+                        else:
+                            results["failed"].append(f"{assertion} (got {actual} bytes)")
+                    except ValueError:
+                        results["failed"].append(f"{assertion} (expected integer)")
+                else:
+                    results["failed"].append(f"{assertion} (unsupported field)")
             except Exception as e:
                 results["failed"].append(f"{assertion} (error: {e})")
-        
+
         return results
+
+    def _compare(self, actual, op, expected):
+        """Compare actual and expected based on operator"""
+        try:
+            if op in ['==', '!=']:
+                result = str(actual) == str(expected) if op == '==' else str(actual) != str(expected)
+            else:
+                # For numeric comparisons
+                actual_num = float(actual)
+                expected_num = float(expected)
+                if op == '>':
+                    result = actual_num > expected_num
+                elif op == '<':
+                    result = actual_num < expected_num
+                elif op == '>=':
+                    result = actual_num >= expected_num
+                elif op == '<=':
+                    result = actual_num <= expected_num
+                else:
+                    result = False
+        except (ValueError, TypeError):
+            result = False  # Non-numeric comparison failed
+        return result
 
 
 # CLI Commands
@@ -228,21 +331,36 @@ def cli(env):
 @click.option('--show-headers', is_flag=True, help='Show response headers')
 @click.option('--test', multiple=True, help='Assertions (e.g., status_code==200, body.id==123)')
 @click.option('--save', help='Save request to collection')
-def request(method, url, header, param, body, file, auth, timeout, no_verify, show_headers, test, save):
+@click.option('--retry', default=0, type=int, help='Number of retries on failure')
+@click.option('--retry-delay', default=1.0, type=float, help='Initial delay between retries in seconds')
+@click.option('--export-response', help='Export response body to file')
+@click.option('--graphql', is_flag=True, help='Send as GraphQL request')
+@click.option('--variables', help='GraphQL variables as JSON string')
+def request(method, url, header, param, body, file, auth, timeout, no_verify, show_headers, test, save, retry, retry_delay, export_response, graphql, variables):
     """Send HTTP request"""
     # Parse headers
     headers = {}
     for h in header:
-        if ':' in h:
+        try:
+            if ':' not in h:
+                raise ValueError("Header must be in format Key:Value")
             key, value = h.split(':', 1)
             headers[key.strip()] = value.strip()
-    
+        except ValueError as e:
+            console.print(f"[red]Invalid header '{h}': {e}[/red]")
+            raise click.Abort()
+
     # Parse params
     params = {}
     for p in param:
-        if '=' in p:
+        try:
+            if '=' not in p:
+                raise ValueError("Param must be in format key=value")
             key, value = p.split('=', 1)
             params[key.strip()] = value.strip()
+        except ValueError as e:
+            console.print(f"[red]Invalid param '{p}': {e}[/red]")
+            raise click.Abort()
     
     # Parse body
     body_data = None
@@ -266,6 +384,23 @@ def request(method, url, header, param, body, file, auth, timeout, no_verify, sh
             except:
                 body_data = body
     
+    # Handle GraphQL
+    if graphql:
+        if not body_data:
+            console.print("[red]GraphQL requires a query body[/red]")
+            raise click.Abort()
+        graphql_body = {"query": body_data}
+        if variables:
+            try:
+                graphql_body["variables"] = json.loads(variables)
+            except:
+                console.print("[red]Invalid JSON for GraphQL variables[/red]")
+                raise click.Abort()
+        body_data = graphql_body
+        if not headers:
+            headers = {}
+        headers["Content-Type"] = "application/json"
+
     # Parse auth
     auth_tuple = None
     if auth:
@@ -285,21 +420,37 @@ def request(method, url, header, param, body, file, auth, timeout, no_verify, sh
             body=body_data,
             auth=auth_tuple,
             timeout=timeout,
-            verify=not no_verify
+            verify=not no_verify,
+            retry_count=retry,
+            retry_delay=retry_delay,
+            context=None
         )
         
         # Display response
         console.print(tester.format_response(response, show_headers))
-        
+
+        # Export response if requested
+        if export_response:
+            try:
+                with open(export_response, 'w') as f:
+                    if response.headers.get('content-type', '').startswith('application/json'):
+                        json.dump(response.json(), f, indent=2)
+                    else:
+                        f.write(response.text)
+                console.print(f"[green]Response exported to {export_response}[/green]")
+            except Exception as e:
+                console.print(f"[red]Failed to export response: {e}[/red]")
+
         # Run tests
         if test:
             console.print("\n[bold]Running Tests:[/bold]")
-            results = tester.run_test(response, list(test))
+            response_time = response.elapsed.total_seconds()
+            results = tester.run_test(response, list(test), response_time)
             for passed in results["passed"]:
                 console.print(f"[green]✓ {passed}[/green]")
             for failed in results["failed"]:
                 console.print(f"[red]✗ {failed}[/red]")
-            
+
             if not results["failed"]:
                 console.print("\n[bold green]All tests passed![/bold green]")
             else:
@@ -315,7 +466,12 @@ def request(method, url, header, param, body, file, auth, timeout, no_verify, sh
                 "url": url,
                 "headers": headers,
                 "params": params,
-                "body": body_data
+                "body": body_data,
+                "auth": auth_tuple,
+                "timeout": timeout,
+                "verify": not no_verify,
+                "retry_count": retry,
+                "retry_delay": retry_delay
             }
             # Load existing collection or create new
             collection = tester.load_collection(save)
@@ -417,44 +573,138 @@ def history():
     console.print(table)
 
 @cli.command()
+def interactive():
+    """Interactive mode for building requests"""
+    console.print("[bold]Interactive API Tester[/bold]\n")
+
+    method = click.prompt("Method", type=click.Choice(['get', 'post', 'put', 'delete', 'patch', 'head', 'options']), default='get')
+    url = click.prompt("URL")
+    headers = {}
+    while click.confirm("Add header?"):
+        key = click.prompt("Header key")
+        value = click.prompt("Header value")
+        headers[key] = value
+    params = {}
+    while click.confirm("Add query param?"):
+        key = click.prompt("Param key")
+        value = click.prompt("Param value")
+        params[key] = value
+    body = None
+    if method.lower() in ['post', 'put', 'patch']:
+        if click.confirm("Add body?"):
+            body_type = click.prompt("Body type", type=click.Choice(['json', 'text']), default='json')
+            if body_type == 'json':
+                body_str = click.prompt("JSON body")
+                try:
+                    body = json.loads(body_str)
+                except:
+                    console.print("[red]Invalid JSON[/red]")
+                    return
+            else:
+                body = click.prompt("Text body")
+    auth = None
+    if click.confirm("Add auth?"):
+        username = click.prompt("Username")
+        password = click.prompt("Password", hide_input=True)
+        auth = (username, password)
+
+    # Now send the request
+    try:
+        response = tester.send_request(
+            method=method,
+            url=url,
+            headers=headers or None,
+            params=params or None,
+            body=body,
+            auth=auth
+        )
+        console.print(tester.format_response(response, False))
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+@cli.command()
+@click.argument('file1', type=click.Path(exists=True))
+@click.argument('file2', type=click.Path(exists=True))
+def diff(file1, file2):
+    """Diff two JSON response files"""
+    try:
+        with open(file1, 'r') as f1, open(file2, 'r') as f2:
+            data1 = json.load(f1)
+            data2 = json.load(f2)
+        str1 = json.dumps(data1, indent=2, sort_keys=True)
+        str2 = json.dumps(data2, indent=2, sort_keys=True)
+        diff_lines = list(difflib.unified_diff(str1.splitlines(), str2.splitlines(), fromfile=file1, tofile=file2))
+        if diff_lines:
+            console.print('\n'.join(diff_lines))
+        else:
+            console.print("[green]Files are identical[/green]")
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+@cli.command()
 @click.argument('name')
-def run_collection(name):
+@click.option('--parallel', is_flag=True, help='Run requests in parallel')
+def run_collection(name, parallel):
     """Run all requests in a collection"""
     collection = tester.load_collection(name)
     if not collection:
         return
     
     console.print(f"[bold]Running collection: {name}[/bold]\n")
-    
-    results = {"passed": 0, "failed": 0, "total": len(collection.get("requests", []))}
-    
-    for i, req in enumerate(collection.get("requests", []), 1):
+
+    requests_list = collection.get("requests", [])
+    results = {"passed": 0, "failed": 0, "total": len(requests_list)}
+
+    def run_single_request(i, req, context):
         console.print(f"[bold cyan]Request {i}/{results['total']}[/bold cyan]")
-        
         try:
             response = tester.send_request(
                 method=req.get("method", "GET"),
                 url=req.get("url", ""),
                 headers=req.get("headers"),
                 params=req.get("params"),
-                body=req.get("body")
+                body=req.get("body"),
+                auth=req.get("auth"),
+                timeout=req.get("timeout", 30),
+                verify=req.get("verify", True),
+                retry_count=req.get("retry_count", 0),
+                retry_delay=req.get("retry_delay", 1.0),
+                context=context
             )
-            
+
             status_color = "green" if response.status_code < 400 else "red"
             console.print(f"  [{status_color}]{req.get('method', 'GET')} {req.get('url', '')} → {response.status_code}[/{status_color}]")
-            
-            if response.status_code < 400:
+
+            tester.save_to_history(req.get("method", "GET"), req.get("url", ""), response)
+            # Add to context
+            try:
+                context[f"response{i-1}"] = response.json()
+            except:
+                context[f"response{i-1}"] = response.text
+            return response.status_code < 400
+        except Exception as e:
+            console.print(f"  [red]Error: {e}[/red]")
+            return False
+
+    context = {}
+    if parallel:
+        console.print("[yellow]Warning: Request chaining is disabled in parallel mode[/yellow]")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(requests_list))) as executor:
+            futures = [executor.submit(run_single_request, i, req, {}) for i, req in enumerate(requests_list, 1)]
+            for future in concurrent.futures.as_completed(futures):
+                if future.result():
+                    results["passed"] += 1
+                else:
+                    results["failed"] += 1
+                console.print()
+    else:
+        for i, req in enumerate(requests_list, 1):
+            if run_single_request(i, req, context):
                 results["passed"] += 1
             else:
                 results["failed"] += 1
-            
-            tester.save_to_history(req.get("method", "GET"), req.get("url", ""), response)
-        except Exception as e:
-            console.print(f"  [red]Error: {e}[/red]")
-            results["failed"] += 1
-        
-        console.print()
-    
+            console.print()
+
     console.print(f"[bold]Results: {results['passed']}/{results['total']} passed, {results['failed']} failed[/bold]")
 
 @cli.command()
